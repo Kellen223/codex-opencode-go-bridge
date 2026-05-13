@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import http from "node:http";
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -10,11 +10,14 @@ const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), ".codex");
 const CODEX_CONFIG = join(CODEX_HOME, "config.toml");
 const CODEX_SESSIONS = join(CODEX_HOME, "sessions");
 const CODEX_SESSIONS_ARCHIVE = join(CODEX_HOME, "sessions-archive");
+const BRIDGE_EVENTS = join(CODEX_HOME, "opencode-go-bridge", "events.jsonl");
 const OPENCODE_BASE_URL =
   process.env.OPENCODE_GO_BASE_URL || "https://opencode.ai/zen/go/v1";
 const DEFAULT_OPENCODE_MODEL =
   process.env.OPENCODE_GO_MODEL || "deepseek-v4-flash";
 const SUPPORTED_MODELS = new Set(["deepseek-v4-flash", "deepseek-v4-pro"]);
+let lastForwardedModel = null;
+let lastBridgeEvent = null;
 const SELECTABLE_MODELS = [
   {
     id: "deepseek-v4-flash",
@@ -246,15 +249,96 @@ function extractInputText(content) {
     .join(" ");
 }
 
-function effectiveSessionModel(provider, model) {
-  if (provider === "opencode-go-bridge" && !SUPPORTED_MODELS.has(model)) {
-    return DEFAULT_OPENCODE_MODEL;
+function extractRequestTitle(input) {
+  if (typeof input === "string") return summarizeText(input, 96);
+  if (!Array.isArray(input)) return "";
+  for (const item of input) {
+    if (item?.role === "user") {
+      const text = extractInputText(item.content);
+      if (
+        text &&
+        !text.trim().startsWith("<environment_context>") &&
+        !text.trim().startsWith("<permissions instructions>")
+      ) {
+        return summarizeText(text, 96);
+      }
+    }
+    if (item?.type === "input_text" || item?.type === "text") {
+      return summarizeText(item.text, 96);
+    }
+  }
+  return "";
+}
+
+async function appendBridgeEvent(event) {
+  lastBridgeEvent = event;
+  await mkdir(join(CODEX_HOME, "opencode-go-bridge"), { recursive: true });
+  await appendFile(BRIDGE_EVENTS, `${JSON.stringify(event)}\n`, "utf8");
+}
+
+async function readBridgeEvents(limit = 200) {
+  try {
+    const text = await readFile(BRIDGE_EVENTS, "utf8");
+    const events = [];
+    for (const line of text.split(/\r?\n/).filter(Boolean).slice(-limit)) {
+      try {
+        const event = JSON.parse(line.replace(/^\uFEFF/, ""));
+        if (event?.forwarded_model) events.push(event);
+      } catch {
+        // Ignore partial or corrupted bridge event lines.
+      }
+    }
+    return events;
+  } catch {
+    return [];
+  }
+}
+
+function findBridgeEventForSession(session, events) {
+  const sessionTime = Date.parse(session.last_activity_at || session.started_at || "");
+  if (!Number.isFinite(sessionTime)) return null;
+  const title = summarizeText(session.title, 96);
+  let best = null;
+  let bestDistance = Infinity;
+
+  for (const event of events) {
+    const eventTime = Date.parse(event.timestamp || "");
+    if (!Number.isFinite(eventTime)) continue;
+    const distance = Math.abs(eventTime - sessionTime);
+    if (distance > 10 * 60 * 1000) continue;
+
+    const eventTitle = summarizeText(event.title, 96);
+    const titleMatches =
+      title &&
+      eventTitle &&
+      (title === eventTitle || title.startsWith(eventTitle) || eventTitle.startsWith(title));
+    if (!titleMatches && distance > 90 * 1000) continue;
+
+    if (distance < bestDistance) {
+      best = event;
+      bestDistance = distance;
+    }
+  }
+
+  return best;
+}
+
+function currentBridgeDefaultModel(config) {
+  return SUPPORTED_MODELS.has(config?.model)
+    ? config.model
+    : DEFAULT_OPENCODE_MODEL;
+}
+
+function effectiveSessionModel(provider, model, bridgeEvent) {
+  if (provider === "opencode-go-bridge" && bridgeEvent?.forwarded_model) {
+    return bridgeEvent.forwarded_model;
   }
   return model || null;
 }
 
 async function readRecentSessions() {
   const files = await collectSessionFiles(CODEX_SESSIONS);
+  const bridgeEvents = await readBridgeEvents();
   const sessions = [];
 
   for (const file of files) {
@@ -293,7 +377,7 @@ async function readRecentSessions() {
     if (!meta && !context) continue;
     const provider = meta?.model_provider || null;
     const model = context?.model || null;
-    sessions.push({
+    const session = {
       id: meta?.id || null,
       title: summarizeText(title),
       started_at: meta?.timestamp || null,
@@ -302,9 +386,19 @@ async function readRecentSessions() {
       originator: meta?.originator || null,
       provider,
       model,
-      effective_model: effectiveSessionModel(provider, model),
+      effective_model: null,
+      bridge_forwarded_model: null,
+      bridge_requested_model: null,
       file: file.path,
-    });
+    };
+    const bridgeEvent =
+      provider === "opencode-go-bridge"
+        ? findBridgeEventForSession(session, bridgeEvents)
+        : null;
+    session.bridge_forwarded_model = bridgeEvent?.forwarded_model || null;
+    session.bridge_requested_model = bridgeEvent?.requested_model || null;
+    session.effective_model = effectiveSessionModel(provider, model, bridgeEvent);
+    sessions.push(session);
   }
 
   return sessions
@@ -352,13 +446,18 @@ async function deleteSession(sessionId) {
 
 async function readDashboardState() {
   const config = await readCodexConfig();
+  const defaultModel = currentBridgeDefaultModel(config);
+  const bridgeEvents = await readBridgeEvents(1);
+  const latestBridgeEvent = lastBridgeEvent || bridgeEvents.at(-1) || null;
   const sessions = await readRecentSessions();
   return {
     ok: true,
     bridge: {
       port: PORT,
-      default_model: DEFAULT_OPENCODE_MODEL,
+      default_model: defaultModel,
       supported_models: [...SUPPORTED_MODELS],
+      last_forwarded_model: lastForwardedModel || latestBridgeEvent?.forwarded_model || null,
+      last_event: latestBridgeEvent,
     },
     codex: config,
     selectable_models: SELECTABLE_MODELS,
@@ -514,6 +613,22 @@ function dashboardHtml() {
       min-height: 32px;
       padding: 0 10px;
     }
+    .session-details td {
+      background: color-mix(in srgb, var(--panel) 92%, var(--bg));
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 18px;
+    }
+    .detail-grid span {
+      display: block;
+      color: var(--ink);
+      margin-top: 2px;
+      word-break: break-all;
+    }
     .notice {
       color: var(--warn);
       margin-top: 12px;
@@ -590,7 +705,7 @@ function dashboardHtml() {
               <th>时间</th>
               <th>最近活动</th>
               <th>摘要</th>
-              <th>模型</th>
+              <th>实际模型</th>
               <th>Provider</th>
               <th>操作</th>
             </tr>
@@ -621,11 +736,21 @@ function dashboardHtml() {
       return new Date(value).toLocaleString();
     }
 
+    function appendDetailLine(container, label, value) {
+      const item = document.createElement("div");
+      item.textContent = label;
+      const text = document.createElement("span");
+      text.textContent = value || "-";
+      item.appendChild(text);
+      container.appendChild(item);
+    }
+
     function render(data) {
       state = data;
       document.getElementById("bridge-status").textContent = "运行中";
       document.getElementById("bridge-detail").textContent =
-        "支持 " + data.bridge.supported_models.join(", ");
+        "支持 " + data.bridge.supported_models.join(", ") +
+        (data.bridge.last_forwarded_model ? " | 最近实际转发 " + data.bridge.last_forwarded_model : "");
       document.getElementById("current-model").textContent =
         data.codex.model || "未设置";
       document.getElementById("current-provider").textContent =
@@ -663,6 +788,30 @@ function dashboardHtml() {
         const actionWrap = document.createElement("div");
         actionWrap.className = "row-actions";
 
+        const detailRow = document.createElement("tr");
+        detailRow.className = "session-details";
+        detailRow.hidden = true;
+        const detailCell = document.createElement("td");
+        detailCell.colSpan = 6;
+        const detailGrid = document.createElement("div");
+        detailGrid.className = "detail-grid";
+        appendDetailLine(detailGrid, "实际模型", session.effective_model || session.model);
+        appendDetailLine(detailGrid, "Codex 原始记录", session.model);
+        appendDetailLine(detailGrid, "Codex 请求模型", session.bridge_requested_model);
+        appendDetailLine(detailGrid, "桥接实际转发", session.bridge_forwarded_model);
+        appendDetailLine(detailGrid, "Provider", session.provider);
+        appendDetailLine(detailGrid, "文件", session.file);
+        detailCell.appendChild(detailGrid);
+        detailRow.appendChild(detailCell);
+
+        const details = document.createElement("button");
+        details.textContent = "详情";
+        details.onclick = () => {
+          detailRow.hidden = !detailRow.hidden;
+          details.textContent = detailRow.hidden ? "详情" : "收起";
+        };
+        actionWrap.appendChild(details);
+
         const archive = document.createElement("button");
         archive.textContent = "归档";
         archive.onclick = () => archiveSession(session);
@@ -677,6 +826,7 @@ function dashboardHtml() {
         actions.appendChild(actionWrap);
         row.appendChild(actions);
         sessions.appendChild(row);
+        sessions.appendChild(detailRow);
       }
     }
 
@@ -968,9 +1118,16 @@ async function handleResponses(req, res) {
 
   const body = await readJson(req);
   const responseId = `resp_${randomUUID()}`;
-  const model = SUPPORTED_MODELS.has(body.model)
-    ? body.model
-    : DEFAULT_OPENCODE_MODEL;
+  const config = await readCodexConfig();
+  const model = currentBridgeDefaultModel(config);
+  lastForwardedModel = model;
+  await appendBridgeEvent({
+    timestamp: new Date().toISOString(),
+    response_id: responseId,
+    requested_model: body.model || null,
+    forwarded_model: model,
+    title: extractRequestTitle(body.input),
+  });
   const chatBody = {
     model,
     messages: responsesInputToMessages(body.input),
@@ -1030,9 +1187,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === "GET" && url.pathname === "/health") {
+      const config = await readCodexConfig();
       sendJson(res, 200, {
         ok: true,
-        default_model: DEFAULT_OPENCODE_MODEL,
+        default_model: currentBridgeDefaultModel(config),
         supported_models: [...SUPPORTED_MODELS],
       });
       return;
