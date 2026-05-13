@@ -246,6 +246,13 @@ function extractInputText(content) {
     .join(" ");
 }
 
+function effectiveSessionModel(provider, model) {
+  if (provider === "opencode-go-bridge" && !SUPPORTED_MODELS.has(model)) {
+    return DEFAULT_OPENCODE_MODEL;
+  }
+  return model || null;
+}
+
 async function readRecentSessions() {
   const files = await collectSessionFiles(CODEX_SESSIONS);
   const sessions = [];
@@ -284,6 +291,8 @@ async function readRecentSessions() {
     }
 
     if (!meta && !context) continue;
+    const provider = meta?.model_provider || null;
+    const model = context?.model || null;
     sessions.push({
       id: meta?.id || null,
       title: summarizeText(title),
@@ -291,8 +300,9 @@ async function readRecentSessions() {
       last_activity_at: lastTimestamp,
       cwd: meta?.cwd || context?.cwd || null,
       originator: meta?.originator || null,
-      provider: meta?.model_provider || null,
-      model: context?.model || null,
+      provider,
+      model,
+      effective_model: effectiveSessionModel(provider, model),
       file: file.path,
     });
   }
@@ -645,7 +655,7 @@ function dashboardHtml() {
         row.appendChild(titleCell);
         row.insertAdjacentHTML(
           "beforeend",
-          "<td><code>" + (session.model || "-") + "</code></td>" +
+          "<td><code>" + (session.effective_model || session.model || "-") + "</code></td>" +
           "<td><code>" + (session.provider || "-") + "</code></td>",
         );
 
