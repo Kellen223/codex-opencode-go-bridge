@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+npm-debug.log*
+*.log
+.env
+.env.*
+!.env.example
+dist/
+coverage/
+*.zip
+*.tar.gz
